@@ -1,0 +1,923 @@
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+from unittest import mock
+
+from neutronclient.common import exceptions as neutron_exc
+from neutronclient.neutron import v2_0 as neutronV20
+from neutronclient.v2_0 import client as neutronclient
+
+from heat.common import exception
+from heat.common import template_format
+from heat.engine.clients.os import neutron
+from heat.engine import scheduler
+from heat.engine import stack as parser
+from heat.engine import template
+from heat.tests import common
+from heat.tests import utils
+
+
+class SecurityGroupTest(common.HeatTestCase):
+
+    test_template = '''
+heat_template_version: 2015-04-30
+resources:
+  the_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: HTTP and SSH access
+      rules:
+      - port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+        protocol: tcp
+        description: SSH access
+      - port_range_min: 80
+        port_range_max: 80
+        protocol: tcp
+        remote_ip_prefix: 0.0.0.0/0
+        description: HTTP traffic
+      - remote_mode: remote_group_id
+        remote_group_id: wwww
+        protocol: tcp
+      - direction: egress
+        port_range_min: 22
+        port_range_max: 22
+        protocol: tcp
+        remote_ip_prefix: 10.0.1.0/24
+      - direction: egress
+        remote_mode: remote_group_id
+        remote_group_id: xxxx
+        protocol: gre
+        description: GRE tunnel
+      - direction: egress
+        remote_mode: remote_group_id
+        remote_group_id: xxxx
+      - direction: egress
+        remote_mode: remote_group_id
+'''
+
+    test_template_update = '''
+heat_template_version: 2015-04-30
+resources:
+  the_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: SSH access for private network
+      name: myrules
+      rules:
+      - port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+        protocol: tcp
+      - port_range_min: 443
+        port_range_max: 443
+        remote_ip_prefix: 0.0.0.0/0
+        protocol: tcp
+      - port_range_min: 8080
+        port_range_max: 8080
+        remote_ip_prefix: 0.0.0.0/0
+        protocol: tcp
+      - port_range_min: 53
+        port_range_max: 53
+        remote_ip_prefix: 0.0.0.0/0
+        protocol: udp
+      - direction: egress
+        port_range_min: 22
+        port_range_max: 22
+        protocol: tcp
+        remote_ip_prefix: 10.0.1.0/24
+'''
+
+    test_template_validate = '''
+heat_template_version: 2015-04-30
+resources:
+  the_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: default
+'''
+
+    test_template_explicit_stateless = '''
+heat_template_version: 2015-04-30
+resources:
+  the_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Stateless SG
+      stateful: false
+'''
+
+    test_template_explicit_stateful = '''
+heat_template_version: 2015-04-30
+resources:
+  the_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Explicit Stateful SG
+      stateful: true
+'''
+
+    test_template_implicit_stateful = '''
+heat_template_version: 2015-04-30
+resources:
+  the_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Implicit Stateful SG
+'''
+
+    def setUp(self):
+        super(SecurityGroupTest, self).setUp()
+        self.mockclient = mock.Mock(spec=neutronclient.Client)
+        self.patchobject(neutronclient, 'Client', return_value=self.mockclient)
+
+        def lookup(client, lookup_type, name, cmd_resource):
+            return name
+
+        self.patchobject(neutronV20, 'find_resourceid_by_name_or_id',
+                         side_effect=lookup)
+        self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
+                         return_value=True)
+
+    def create_stack(self, templ):
+        t = template_format.parse(templ)
+        self.stack = self.parse_stack(t)
+        self.assertIsNone(self.stack.create())
+        return self.stack
+
+    def parse_stack(self, t):
+        stack_name = 'test_stack'
+        tmpl = template.Template(t)
+        stack = parser.Stack(utils.dummy_context(), stack_name, tmpl)
+        stack.store()
+        return stack
+
+    def assertResourceState(self, rsrc, ref_id, metadata=None):
+        metadata = metadata or {}
+        self.assertIsNone(rsrc.validate())
+        self.assertEqual((rsrc.CREATE, rsrc.COMPLETE), rsrc.state)
+        self.assertEqual(ref_id, rsrc.FnGetRefId())
+        self.assertEqual(metadata, dict(rsrc.metadata_get()))
+
+    def assert_create_sg_called_with(self, name, description, stateful=None):
+        self.mockclient.create_security_group.assert_called_once()
+        payload = self.mockclient.create_security_group.call_args[0][0]
+        expected = {
+            'security_group': {
+                'name': name,
+                'description': description,
+            }
+        }
+        if stateful is not None:
+            expected['security_group']['stateful'] = stateful
+        self.assertEqual(expected, payload)
+
+    def test_security_group(self):
+
+        show_created = {'security_group': {
+            'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+            'name': 'sc1',
+            'description': '',
+            'security_group_rules': [{
+                'direction': 'ingress',
+                'protocol': 'tcp',
+                'port_range_max': '22',
+                'id': 'bbbb',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '0.0.0.0/0',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '22'
+            }, {
+                'direction': 'ingress',
+                'protocol': 'tcp',
+                'port_range_max': '80',
+                'id': 'cccc',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '0.0.0.0/0',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '80'
+            }, {
+                'direction': 'ingress',
+                'protocol': 'tcp',
+                'port_range_max': None,
+                'id': 'dddd',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': 'wwww',
+                'remote_ip_prefix': None,
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': None
+            }, {
+                'direction': 'egress',
+                'protocol': 'tcp',
+                'port_range_max': '22',
+                'id': 'eeee',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '10.0.1.0/24',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '22'
+            }, {
+                'direction': 'egress',
+                'protocol': 'gre',
+                'port_range_max': None,
+                'id': 'ffff',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': 'xxxx',
+                'remote_ip_prefix': None,
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': None
+            }, {
+                'direction': 'egress',
+                'protocol': None,
+                'port_range_max': None,
+                'id': 'gggg',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': 'xxxx',
+                'remote_ip_prefix': None,
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': None
+            }, {
+                'direction': 'egress',
+                'protocol': None,
+                'port_range_max': None,
+                'id': 'hhhh',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': 'aaaa',
+                'remote_ip_prefix': None,
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': None
+            }],
+            'id': 'aaaa'}
+        }
+
+        # create script
+        sg_name = utils.PhysName('test_stack', 'the_sg')
+        self.mockclient.create_security_group.return_value = {
+            'security_group': {
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'name': sg_name,
+                'description': 'HTTP and SSH access',
+                'security_group_rules': [{
+                    "direction": "egress",
+                    "ethertype": "IPv4",
+                    "id": "aaaa-1",
+                    "port_range_max": None,
+                    "port_range_min": None,
+                    "protocol": None,
+                    "remote_group_id": None,
+                    "remote_ip_prefix": None,
+                    "security_group_id": "aaaa",
+                    "tenant_id": "f18ca530cc05425e8bac0a5ff92f7e88"
+                }, {
+                    "direction": "egress",
+                    "ethertype": "IPv6",
+                    "id": "aaaa-2",
+                    "port_range_max": None,
+                    "port_range_min": None,
+                    "protocol": None,
+                    "remote_group_id": None,
+                    "remote_ip_prefix": None,
+                    "security_group_id": "aaaa",
+                    "tenant_id": "f18ca530cc05425e8bac0a5ff92f7e88"
+                }],
+                'id': 'aaaa'
+            }
+        }
+
+        self.mockclient.create_security_group_rule.return_value = {
+            'security_group_rules': []
+        }
+
+        show_after_update = {'security_group': {
+            'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+            'name': 'myrules',
+            'description': 'SSH access for private network',
+            'security_group_rules': [{
+                'direction': 'ingress',
+                'protocol': 'tcp',
+                'port_range_max': '22',
+                'id': 'bbbb',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '0.0.0.0/0',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '22'
+            }, {
+                'direction': 'egress',
+                'protocol': 'tcp',
+                'port_range_max': '22',
+                'id': 'eeee',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '10.0.1.0/24',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '22'
+            }, {
+                'direction': 'ingress',
+                'protocol': 'tcp',
+                'port_range_max': '443',
+                'id': 'hhhh',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '0.0.0.0/0',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '443'
+            }, {
+                'direction': 'ingress',
+                'protocol': 'tcp',
+                'port_range_max': '8080',
+                'id': 'iiii',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '0.0.0.0/0',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '8080'
+            }, {
+                'direction': 'ingress',
+                'protocol': 'udp',
+                'port_range_max': '53',
+                'id': 'jjjj',
+                'ethertype': 'IPv4',
+                'security_group_id': 'aaaa',
+                'remote_group_id': None,
+                'remote_ip_prefix': '0.0.0.0/0',
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'port_range_min': '53'
+            }],
+            'id': 'aaaa'}
+        }
+
+        self.mockclient.show_security_group.side_effect = [
+            {
+                'security_group': {
+                    'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                    'name': sg_name,
+                    'description': 'HTTP and SSH access',
+                    'security_group_rules': [{
+                        "direction": "egress",
+                        "ethertype": "IPv4",
+                        "id": "aaaa-1",
+                        "port_range_max": None,
+                        "port_range_min": None,
+                        "protocol": None,
+                        "remote_group_id": None,
+                        "remote_ip_prefix": None,
+                        "security_group_id": "aaaa",
+                        "tenant_id": "f18ca530cc05425e8bac0a5ff92f7e88"
+                    }, {
+                        "direction": "egress",
+                        "ethertype": "IPv6",
+                        "id": "aaaa-2",
+                        "port_range_max": None,
+                        "port_range_min": None,
+                        "protocol": None,
+                        "remote_group_id": None,
+                        "remote_ip_prefix": None,
+                        "security_group_id": "aaaa",
+                        "tenant_id": "f18ca530cc05425e8bac0a5ff92f7e88"
+                    }],
+                    'id': 'aaaa'
+                }
+            },
+            show_created,
+            show_after_update,
+        ]
+        self.mockclient.delete_security_group_rule.return_value = None
+
+        # update script
+        self.mockclient.update_security_group.return_value = {
+            'security_group': {
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'name': 'myrules',
+                'description': 'SSH access for private network',
+                'security_group_rules': [],
+                'id': 'aaaa'
+            }
+        }
+
+        # delete script
+        self.mockclient.delete_security_group.return_value = None
+
+        stack = self.create_stack(self.test_template)
+
+        sg = stack['the_sg']
+        self.assertResourceState(sg, 'aaaa')
+
+        updated_tmpl = template_format.parse(self.test_template_update)
+        updated_stack = utils.parse_stack(updated_tmpl)
+        stack.update(updated_stack)
+
+        stack.delete()
+
+        self.assert_create_sg_called_with(
+            sg_name, 'HTTP and SSH access')
+        self.mockclient.create_security_group_rule.assert_has_calls([
+            mock.call({
+                'security_group_rules': [
+                    {
+                        'direction': 'ingress',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '0.0.0.0/0',
+                        'port_range_min': '22',
+                        'ethertype': 'IPv4',
+                        'port_range_max': '22',
+                        'protocol': 'tcp',
+                        'description': 'SSH access',
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'ingress',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '0.0.0.0/0',
+                        'port_range_min': '80',
+                        'ethertype': 'IPv4',
+                        'port_range_max': '80',
+                        'protocol': 'tcp',
+                        'description': 'HTTP traffic',
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'ingress',
+                        'remote_group_id': 'wwww',
+                        'remote_ip_prefix': None,
+                        'port_range_min': None,
+                        'ethertype': 'IPv4',
+                        'port_range_max': None,
+                        'protocol': 'tcp',
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'egress',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '10.0.1.0/24',
+                        'port_range_min': '22',
+                        'ethertype': 'IPv4',
+                        'port_range_max': '22',
+                        'protocol': 'tcp',
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'egress',
+                        'remote_group_id': 'xxxx',
+                        'remote_ip_prefix': None,
+                        'port_range_min': None,
+                        'ethertype': 'IPv4',
+                        'port_range_max': None,
+                        'protocol': 'gre',
+                        'description': 'GRE tunnel',
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'egress',
+                        'remote_group_id': 'xxxx',
+                        'remote_ip_prefix': None,
+                        'port_range_min': None,
+                        'ethertype': 'IPv4',
+                        'port_range_max': None,
+                        'protocol': None,
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'egress',
+                        'remote_group_id': 'aaaa',
+                        'remote_ip_prefix': None,
+                        'port_range_min': None,
+                        'ethertype': 'IPv4',
+                        'port_range_max': None,
+                        'protocol': None,
+                        'security_group_id': 'aaaa'
+                    },
+                ]
+            }),
+            mock.call({
+                'security_group_rules': [
+                    {
+                        'direction': 'ingress',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '0.0.0.0/0',
+                        'port_range_min': '443',
+                        'ethertype': 'IPv4',
+                        'port_range_max': '443',
+                        'protocol': 'tcp',
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'ingress',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '0.0.0.0/0',
+                        'port_range_min': '8080',
+                        'ethertype': 'IPv4',
+                        'port_range_max': '8080',
+                        'protocol': 'tcp',
+                        'security_group_id': 'aaaa'
+                    },
+                    {
+                        'direction': 'ingress',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '0.0.0.0/0',
+                        'port_range_min': '53',
+                        'ethertype': 'IPv4',
+                        'port_range_max': '53',
+                        'protocol': 'udp',
+                        'security_group_id': 'aaaa'
+                    },
+                ]
+            }),
+        ])
+        self.mockclient.show_security_group.assert_called_with('aaaa')
+        self.mockclient.delete_security_group_rule.assert_has_calls([
+            mock.call('aaaa-1'),
+            mock.call('aaaa-2'),
+            # update: delete only stale rules (bbbb, eeee kept)
+            mock.call('cccc'),
+            mock.call('dddd'),
+            mock.call('ffff'),
+            mock.call('gggg'),
+            mock.call('hhhh'),
+            # delete: remove all remaining rules
+            mock.call('bbbb'),
+            mock.call('eeee'),
+            mock.call('hhhh'),
+            mock.call('iiii'),
+            mock.call('jjjj'),
+        ])
+        self.mockclient.update_security_group.assert_called_once_with(
+            'aaaa',
+            {'security_group': {
+                'description': 'SSH access for private network',
+                'name': 'myrules'}}
+        )
+        self.mockclient.delete_security_group.assert_called_once_with('aaaa')
+
+    def test_security_group_exception(self):
+        # create script
+        sg_name = utils.PhysName('test_stack', 'the_sg')
+        self.mockclient.create_security_group.return_value = {
+            'security_group': {
+                'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                'name': sg_name,
+                'description': 'HTTP and SSH access',
+                'security_group_rules': [],
+                'id': 'aaaa'
+            }
+        }
+        self.mockclient.create_security_group_rule.return_value = {
+            'security_group_rules': []
+        }
+
+        self.mockclient.show_security_group.side_effect = [
+            {
+                'security_group': {
+                    'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                    'name': sg_name,
+                    'description': 'HTTP and SSH access',
+                    'security_group_rules': [],
+                    'id': 'aaaa'
+                }
+            },
+            # delete script
+            {
+                'security_group': {
+                    'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                    'name': 'sc1',
+                    'description': '',
+                    'security_group_rules': [{
+                        'direction': 'ingress',
+                        'protocol': 'tcp',
+                        'port_range_max': '22',
+                        'id': 'bbbb',
+                        'ethertype': 'IPv4',
+                        'security_group_id': 'aaaa',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '0.0.0.0/0',
+                        'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                        'port_range_min': '22'
+                    }, {
+                        'direction': 'ingress',
+                        'protocol': 'tcp',
+                        'port_range_max': '80',
+                        'id': 'cccc',
+                        'ethertype': 'IPv4',
+                        'security_group_id': 'aaaa',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '0.0.0.0/0',
+                        'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                        'port_range_min': '80'
+                    }, {
+                        'direction': 'ingress',
+                        'protocol': 'tcp',
+                        'port_range_max': None,
+                        'id': 'dddd',
+                        'ethertype': 'IPv4',
+                        'security_group_id': 'aaaa',
+                        'remote_group_id': 'wwww',
+                        'remote_ip_prefix': None,
+                        'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                        'port_range_min': None
+                    }, {
+                        'direction': 'egress',
+                        'protocol': 'tcp',
+                        'port_range_max': '22',
+                        'id': 'eeee',
+                        'ethertype': 'IPv4',
+                        'security_group_id': 'aaaa',
+                        'remote_group_id': None,
+                        'remote_ip_prefix': '10.0.1.0/24',
+                        'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                        'port_range_min': '22'
+                    }, {
+                        'direction': 'egress',
+                        'protocol': 'gre',
+                        'port_range_max': None,
+                        'id': 'ffff',
+                        'ethertype': 'IPv4',
+                        'security_group_id': 'aaaa',
+                        'remote_group_id': 'xxxx',
+                        'remote_ip_prefix': None,
+                        'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                        'port_range_min': None
+                    }, {
+                        'direction': 'egress',
+                        'protocol': None,
+                        'port_range_max': None,
+                        'id': 'gggg',
+                        'ethertype': 'IPv4',
+                        'security_group_id': 'aaaa',
+                        'remote_group_id': 'xxxx',
+                        'remote_ip_prefix': None,
+                        'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                        'port_range_min': None
+                    }, {
+                        'direction': 'egress',
+                        'protocol': None,
+                        'port_range_max': None,
+                        'id': 'hhhh',
+                        'ethertype': 'IPv4',
+                        'security_group_id': 'aaaa',
+                        'remote_group_id': 'aaaa',
+                        'remote_ip_prefix': None,
+                        'tenant_id': 'f18ca530cc05425e8bac0a5ff92f7e88',
+                        'port_range_min': None
+                    }],
+                    'id': 'aaaa'}
+            },
+            neutron_exc.NeutronClientException(status_code=404),
+        ]
+
+        # delete script
+        self.mockclient.delete_security_group_rule.side_effect = (
+            neutron_exc.NeutronClientException(status_code=404))
+        self.mockclient.delete_security_group.side_effect = (
+            neutron_exc.NeutronClientException(status_code=404))
+
+        stack = self.create_stack(self.test_template)
+
+        sg = stack['the_sg']
+
+        self.assertResourceState(sg, 'aaaa')
+
+        scheduler.TaskRunner(sg.delete)()
+
+        sg.state_set(sg.CREATE, sg.COMPLETE, 'to delete again')
+        sg.resource_id = 'aaaa'
+        stack.delete()
+
+        self.assert_create_sg_called_with(
+            sg_name, 'HTTP and SSH access')
+        self.mockclient.create_security_group_rule.assert_called_once_with({
+            'security_group_rules': [
+                {
+                    'direction': 'ingress',
+                    'remote_group_id': None,
+                    'remote_ip_prefix': '0.0.0.0/0',
+                    'port_range_min': '22',
+                    'ethertype': 'IPv4',
+                    'port_range_max': '22',
+                    'protocol': 'tcp',
+                    'description': 'SSH access',
+                    'security_group_id': 'aaaa'
+                },
+                {
+                    'direction': 'ingress',
+                    'remote_group_id': None,
+                    'remote_ip_prefix': '0.0.0.0/0',
+                    'port_range_min': '80',
+                    'ethertype': 'IPv4',
+                    'port_range_max': '80',
+                    'protocol': 'tcp',
+                    'description': 'HTTP traffic',
+                    'security_group_id': 'aaaa'
+                },
+                {
+                    'direction': 'ingress',
+                    'remote_group_id': 'wwww',
+                    'remote_ip_prefix': None,
+                    'port_range_min': None,
+                    'ethertype': 'IPv4',
+                    'port_range_max': None,
+                    'protocol': 'tcp',
+                    'security_group_id': 'aaaa'
+                },
+                {
+                    'direction': 'egress',
+                    'remote_group_id': None,
+                    'remote_ip_prefix': '10.0.1.0/24',
+                    'port_range_min': '22',
+                    'ethertype': 'IPv4',
+                    'port_range_max': '22',
+                    'protocol': 'tcp',
+                    'security_group_id': 'aaaa'
+                },
+                {
+                    'direction': 'egress',
+                    'remote_group_id': 'xxxx',
+                    'remote_ip_prefix': None,
+                    'port_range_min': None,
+                    'ethertype': 'IPv4',
+                    'port_range_max': None,
+                    'protocol': 'gre',
+                    'description': 'GRE tunnel',
+                    'security_group_id': 'aaaa'
+                },
+                {
+                    'direction': 'egress',
+                    'remote_group_id': 'xxxx',
+                    'remote_ip_prefix': None,
+                    'port_range_min': None,
+                    'ethertype': 'IPv4',
+                    'port_range_max': None,
+                    'protocol': None,
+                    'security_group_id': 'aaaa'
+                },
+                {
+                    'direction': 'egress',
+                    'remote_group_id': 'aaaa',
+                    'remote_ip_prefix': None,
+                    'port_range_min': None,
+                    'ethertype': 'IPv4',
+                    'port_range_max': None,
+                    'protocol': None,
+                    'security_group_id': 'aaaa'
+                },
+            ]
+        })
+        self.mockclient.show_security_group.assert_called_with('aaaa')
+        self.mockclient.delete_security_group_rule.assert_has_calls([
+            mock.call('bbbb'),
+            mock.call('cccc'),
+            mock.call('dddd'),
+            mock.call('eeee'),
+            mock.call('ffff'),
+            mock.call('gggg'),
+            mock.call('hhhh'),
+        ])
+        self.mockclient.delete_security_group.assert_called_with('aaaa')
+
+    def test_security_group_validate(self):
+        stack = self.create_stack(self.test_template_validate)
+        sg = stack['the_sg']
+        ex = self.assertRaises(exception.StackValidationFailed, sg.validate)
+        self.assertEqual(
+            'Security groups cannot be assigned the name "default".',
+            ex.message)
+
+    def test_security_group_create_explicit_stateful_false(self):
+        sg_name = utils.PhysName('test_stack', 'the_sg')
+        self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
+                         return_value=True)
+        self.mockclient.create_security_group.return_value = {
+            'security_group': {
+                'id': 'aaaa',
+                'name': sg_name,
+                'description': 'Stateless SG',
+            }
+        }
+
+        stack = self.create_stack(self.test_template_explicit_stateless)
+        sg = stack['the_sg']
+        self.assertResourceState(sg, 'aaaa')
+
+        self.assert_create_sg_called_with(
+            sg_name, 'Stateless SG', stateful=False)
+
+    def test_security_group_create_explicit_stateful_true(self):
+        sg_name = utils.PhysName('test_stack', 'the_sg')
+        self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
+                         return_value=True)
+        self.mockclient.create_security_group.return_value = {
+            'security_group': {
+                'id': 'bbbb',
+                'name': sg_name,
+                'description': 'Explicit Stateful SG',
+            }
+        }
+
+        stack = self.create_stack(self.test_template_explicit_stateful)
+        sg = stack['the_sg']
+        self.assertResourceState(sg, 'bbbb')
+
+        self.assert_create_sg_called_with(
+            sg_name, 'Explicit Stateful SG', stateful=True)
+
+    def test_security_group_create_implicit_stateful(self):
+        sg_name = utils.PhysName('test_stack', 'the_sg')
+        self.patchobject(neutron.NeutronClientPlugin, 'has_extension',
+                         return_value=True)
+        self.mockclient.create_security_group.return_value = {
+            'security_group': {
+                'id': 'cccc',
+                'name': sg_name,
+                'description': 'Implicit Stateful SG',
+            }
+        }
+
+        stack = self.create_stack(self.test_template_implicit_stateful)
+        sg = stack['the_sg']
+        self.assertResourceState(sg, 'cccc')
+
+        self.assert_create_sg_called_with(
+            sg_name, 'Implicit Stateful SG')
+
+    def test_security_group_update_stateful_flag(self):
+        sg_name = utils.PhysName('test_stack', 'the_sg')
+        self.mockclient.create_security_group.return_value = {
+            'security_group': {
+                'id': 'aaaa',
+                'name': sg_name,
+                'description': 'Stateless SG',
+            }
+        }
+        self.mockclient.update_security_group.return_value = {
+            'security_group': {
+                'id': 'aaaa',
+                'name': sg_name,
+                'description': 'Explicit Stateful SG',
+                'stateful': True,
+            }
+        }
+
+        stack = self.create_stack(self.test_template_explicit_stateless)
+        sg = stack['the_sg']
+        self.assertResourceState(sg, 'aaaa')
+
+        self.mockclient.list_ports.return_value = {'ports': []}
+        updated_tmpl = template_format.parse(
+            self.test_template_explicit_stateful)
+        updated_stack = utils.parse_stack(updated_tmpl)
+        stack.update(updated_stack)
+
+        self.mockclient.update_security_group.assert_called_once_with(
+            'aaaa', {'security_group': {
+                'description': 'Explicit Stateful SG',
+                'stateful': True}})
+        self.mockclient.list_ports.assert_called_once_with(
+            security_groups=['aaaa'])
+
+    def test_security_group_update_stateful_rejects_bound_ports(self):
+        sg_name = utils.PhysName('test_stack', 'the_sg')
+        self.mockclient.create_security_group.return_value = {
+            'security_group': {
+                'id': 'aaaa',
+                'name': sg_name,
+                'description': 'Stateless SG',
+                'stateful': False,
+            }
+        }
+
+        stack = self.create_stack(self.test_template_explicit_stateless)
+        sg = stack['the_sg']
+        self.assertResourceState(sg, 'aaaa')
+
+        self.mockclient.list_ports.return_value = {
+            'ports': [{'id': 'port-id'}]}
+
+        ex = self.assertRaises(
+            exception.NotSupported,
+            sg.handle_update, None, None, {sg.STATEFUL: True})
+        self.assertIn('Updating the \"stateful\" property',
+                      str(ex))
+        self.mockclient.update_security_group.assert_not_called()

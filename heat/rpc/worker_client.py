@@ -1,0 +1,103 @@
+# Copyright (c) 2014 Hewlett-Packard Development Company, L.P.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Client side of the heat worker RPC API."""
+
+from heat.common import messaging
+from heat.rpc import worker_api
+
+
+class WorkerClient(object):
+    """Client side of the heat worker RPC API.
+
+    API version history::
+
+        1.0 - Initial version.
+        1.1 - Added check_resource.
+        1.2 - Add adopt data argument to check_resource.
+        1.3 - Added cancel_check_resource API.
+        1.4 - Add converge argument to check_resource
+        1.5 - Add skip_propagate argument to check_resource for CHECK action
+        1.6 - Add accumulated_failures argument to check_resource for CHECK
+        1.7 - Added check_resource_delete_snapshot
+        1.8 - Add node_type argument to check_resource for snapshot deletion
+        1.9 - Add abandon argument to check_resource for stack abandon
+    """
+
+    BASE_RPC_API_VERSION = '1.0'
+
+    def __init__(self):
+        self._client = messaging.get_rpc_client(
+            topic=worker_api.TOPIC,
+            version=self.BASE_RPC_API_VERSION)
+
+    @staticmethod
+    def make_msg(method, **kwargs):
+        return method, kwargs
+
+    def cast(self, ctxt, msg, version=None):
+        method, kwargs = msg
+        if version is not None:
+            client = self._client.prepare(version=version)
+        else:
+            client = self._client
+        client.cast(ctxt, method, **kwargs)
+
+    def check_resource_delete_snapshot(
+        self, ctxt, snapshot_id, resource_name, start_time,
+        is_stack_delete=False, current_traversal=None
+    ):
+        self.cast(ctxt,
+                  self.make_msg(
+                      'check_resource_delete_snapshot',
+                      snapshot_id=snapshot_id,
+                      resource_name=resource_name,
+                      start_time=start_time,
+                      is_stack_delete=is_stack_delete,
+                      current_traversal=current_traversal
+                  ),
+                  version='1.7')
+
+    def check_resource(self, ctxt, resource_id,
+                       current_traversal, data, is_update, adopt_stack_data,
+                       converge=False, skip_propagate=False,
+                       accumulated_failures=None, node_type='resource',
+                       abandon=False):
+        self.cast(ctxt,
+                  self.make_msg(
+                      'check_resource', resource_id=resource_id,
+                      current_traversal=current_traversal, data=data,
+                      is_update=is_update, adopt_stack_data=adopt_stack_data,
+                      converge=converge, skip_propagate=skip_propagate,
+                      accumulated_failures=accumulated_failures,
+                      node_type=node_type, abandon=abandon
+                  ),
+                  version='1.9')
+
+    def cancel_check_resource(self, ctxt, stack_id, engine_id):
+        """Send check-resource cancel message.
+
+        Sends a cancel message to given heat engine worker.
+        """
+
+        _client = messaging.get_rpc_client(
+            topic=worker_api.TOPIC,
+            version=self.BASE_RPC_API_VERSION,
+            server=engine_id)
+
+        method, kwargs = self.make_msg('cancel_check_resource',
+                                       stack_id=stack_id)
+        cl = _client.prepare(version='1.3')
+        cl.cast(ctxt, method, **kwargs)
